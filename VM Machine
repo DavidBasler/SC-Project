@@ -1,0 +1,365 @@
+pragma solidity ^0.7.0;
+
+contract Owned {
+    // Contract for the Operator of the Vending Machine
+ 
+    // 0. Constructor
+    
+    constructor() {
+        owner = msg.sender;
+        
+    }
+    
+    // 1. Variables
+    
+    address public owner = msg.sender;
+
+    
+    // 2. Modifier
+    
+    modifier onlyOwner{
+        require(msg.sender == owner,"Sorry, this can only be done by the owner");
+        _;
+    }
+    
+    
+    // 3. Functions
+    
+    function reassignOwner(address _address) public onlyOwner { 
+        owner = _address;
+    }
+    
+
+}
+
+
+contract VendingMachineHandler is Owned{
+    
+    // contract that controls physical vending machine with a fixed number of slots that carry the ids 0:(n-1)
+    
+    // 0. Fallbackfunction to ensure the VM Handler will retain any funds sent
+    receive() external payable{
+    }
+    
+    // 1. Variables & SafeMath
+    
+    using SafeMath for uint256;
+   
+    uint8 public globalPriceFee; // to be divided by 100 to get to percentage
+    uint public globalTimeFee; // in wei per block
+    
+    
+    bool [6] public slotState;
+    uint [6] public salePrice;
+    uint [6] public saleDuration;
+    uint [6] public startBlock;
+    address payable [6] public seller;
+    uint8 [6] public salePriceFee; // in percent
+    uint [6] public saleTimeFee; // in wei per block
+    uint [6] public saleCollateral; // in wei
+    
+    uint public totalCollateral; //used to prevent the owner withdrawing funds that are unearned
+
+    // 2. Constructor
+    
+    constructor(uint8 _globalPriceFee, uint _globalTimeFee) {
+        require(_globalPriceFee >= 0 && _globalPriceFee <= 100, "sorry, price fee must between 0 and 100");
+        globalPriceFee = _globalPriceFee;
+        globalTimeFee = _globalTimeFee;
+    }
+    
+    
+    // 3. Events
+    event saleStarted(
+        uint salePrice,
+        uint saleDuration,
+        address indexed seller, // index here to allow buyers to check if there's an attempted sale history for this seller
+        uint saleCollateral
+    );
+    
+    event Purchase(
+        address indexed buyer,
+        uint purchasePrice,
+        uint payout,
+        address indexed seller // index here to allow buyers to check if there's a successfull sale history for this seller
+    );
+    
+    
+    // 4. Core Process Functions
+    
+    // 4.1 General
+    
+    function getSlotState(uint8 _slotID) public view returns(bool){
+        // Information request, whether an active sale is going on
+        // Basis for physical vending machine to decide whether a slot opens
+        return slotState[_slotID];
+    }
+    
+    
+    // 4.2 Sale Process
+    
+    function getSaleParameters(uint8 _slotID) public view returns(uint, uint) {
+       require(slotState[_slotID] == false, "Sorry, slot is currently busy");
+       return(globalTimeFee, globalPriceFee);
+    }
+    
+    function initiateSale(uint8 _slotID, uint _saleDuration, uint _salePrice, uint8 _salePriceFee, uint _saleTimeFee) external payable returns(bool){
+        // Pre-checks for valid sale initiation
+        require(slotState[_slotID] == false, "Sorry, slot is currently busy");
+        require(_saleTimeFee == globalTimeFee, "Sorry, the time fee has changed");
+        require(_salePriceFee == globalPriceFee, "Sorry, the price fee has changed");
+        require(msg.value >= (_saleDuration.mul(_saleTimeFee)), "Sorry, insufficient collateral");
+        
+        // Capture of Sales parameters for slot and make state adjustments
+        slotState[_slotID] = true;
+        salePrice[_slotID] = _salePrice;
+        saleDuration[_slotID] = _saleDuration;
+        startBlock[_slotID] = block.number; // 
+        seller[_slotID] = tx.origin;
+        salePriceFee[_slotID] = _salePriceFee;
+        saleTimeFee[_slotID] = _saleTimeFee;
+        if(_saleTimeFee.mul(_saleDuration) < msg.value) {
+            tx.origin.transfer(msg.value.sub(_saleTimeFee.mul(_saleDuration))); // return overpaid collateral
+        }
+        saleCollateral[_slotID] = _saleTimeFee.mul(_saleDuration);
+        totalCollateral = totalCollateral.add(_saleTimeFee.mul(_saleDuration)); // this earmarks the collateral as unearned
+        
+        emit saleStarted(_salePrice , _saleDuration,  tx.origin, _saleTimeFee.mul(_saleDuration));
+        
+        return true;
+    }
+    
+    
+    // 4.3 Buy Process Functions
+    
+    function getBuyParameters(uint8 _slotID) public view returns(uint8, uint){
+        require(slotState[_slotID] == true, "Sorry, there is no active sale in this slot");
+        uint currentPrice_ = currentPrice(_slotID);
+        return (_slotID, currentPrice_);
+    }
+    
+    function buy(uint8 _slotID) public payable returns(bool){ 
+        // Pre-checks for valid sale initiation
+        require(slotState[_slotID] == true, "Sorry, there is no active sale in this slot");
+        require(msg.value >= currentPrice(_slotID), "Sorry, insufficient payment");
+        
+        // Release slot and disburse payments
+        slotState[_slotID] = false;
+        if(currentPrice(_slotID) < msg.value) {
+            tx.origin.transfer(msg.value.sub(currentPrice(_slotID))); // return overpaid price
+        }
+        uint payout_ = ((currentPrice(_slotID).mul(100-salePriceFee[_slotID])).div(100)).add(remainingCollateral(_slotID)); 
+        seller[_slotID].transfer(payout_);
+        totalCollateral = totalCollateral.sub(saleCollateral[_slotID]); // this unblocks the contracts fees for withdrawal by owner
+        
+        emit Purchase(tx.origin, currentPrice(_slotID), payout_, seller[_slotID]);
+        
+        return true;
+    }
+    
+    
+    
+    // 4.4.Support Functions
+    
+    function currentPrice(uint8 _slotID) internal view returns(uint resultCP){
+        if (block.number >= startBlock[_slotID].add(saleDuration[_slotID])) {
+            resultCP = 0;
+        } else {
+            resultCP = salePrice[_slotID].sub((salePrice[_slotID].mul(block.number-startBlock[_slotID])).div(saleDuration[_slotID]));
+        }
+    }
+    
+    function remainingCollateral(uint8 _slotID) internal view returns(uint resultRC){
+        if (block.number >= startBlock[_slotID].add(saleDuration[_slotID])) {
+            resultRC = 0;
+        } else {
+            resultRC = saleCollateral[_slotID].sub(saleTimeFee[_slotID].mul(block.number - startBlock[_slotID]));
+        }
+    }
+    
+    
+    
+    // 5. Owner Functions 
+    
+    
+    function checkDisbursableBalance() public view onlyOwner returns(uint availableBalance){
+        return address(this).balance.sub(totalCollateral);
+    }
+    
+    
+    function withdraw (uint _amount) public onlyOwner {
+        require(_amount <= address(this).balance.sub(totalCollateral), "Not enough funds earned yet");
+        msg.sender.transfer(_amount);
+    }
+    
+    function setGlobalPriceFee(uint8 _input) public onlyOwner{
+        require(_input >= 0 && _input <= 100, "sorry, price fee must between 0 and 100");
+        globalPriceFee = _input;
+    }
+    
+    function setGlobalTimeFee(uint _input) public onlyOwner{
+        globalTimeFee = _input;
+    }
+    
+}
+
+
+
+// SafeMath Library from OpenZeppelin: https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/math/SafeMath.sol
+// SPDX-License-Identifier: MIT
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations with added overflow
+ * checks.
+ *
+ * Arithmetic operations in Solidity wrap on overflow. This can easily result
+ * in bugs, because programmers usually assume that an overflow raises an
+ * error, which is the standard behavior in high level programming languages.
+ * `SafeMath` restores this intuition by reverting the transaction when an
+ * operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+        // benefit is lost if 'b' is also tested.
+        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+        if (a == 0) {
+            return 0;
+        }
+
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        // assert(a == b * c + a % b); // There is no case in which this doesn't hold
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return mod(a, b, "SafeMath: modulo by zero");
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts with custom message when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b != 0, errorMessage);
+        return a % b;
+    }
+}
